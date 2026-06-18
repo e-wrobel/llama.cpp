@@ -192,6 +192,11 @@ if (GGML_SYCL_HOST_MEM_FALLBACK)
     target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_HOST_MEM_FALLBACK)
 endif()
 
+if (GGML_SYCL_FORCE_MMQ)
+    message(STATUS "GGML_SYCL_FORCE_MMQ enabled - experimental MMQ for Intel Arc")
+    target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_FORCE_MMQ)
+endif()
+
 if (GGML_SYCL_DEVICE_ARCH)
     message(STATUS "GGML_SYCL_DEVICE_ARCH=${GGML_SYCL_DEVICE_ARCH} (AOT via spir64_gen)")
     target_compile_options(
