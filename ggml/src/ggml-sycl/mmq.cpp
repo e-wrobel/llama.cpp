@@ -11,6 +11,7 @@
 //
 
 #include "mmq.hpp"
+#include "sycl_hw.hpp"
 #include "vecdotq.hpp"
 
 typedef void (*allocate_tiles_sycl_t)(
@@ -1658,6 +1659,18 @@ mul_mat_q3_K(
 #define  MMQ_Y_Q4_K_PASCAL 64
 #define NWARPS_Q4_K_PASCAL 8
 
+// Intel Arc Battlemage (BMG, Xe2).
+// NOTE: Q4_K MMQ is currently DISABLED on BMG — falls back to MMVQ (see ggml_sycl_supports_mmq).
+// Root cause: QI4_K(32) > WARP_SIZE(16) → blocks_per_warp = WARP_SIZE/QI4_K = 0 in mul_mat_q
+// → GPU hangs in an infinite loop. These constants are reserved for a future rewrite of
+// mul_mat_q / load_tiles_q4_K that supports QI > WARP_SIZE on Intel subgroup size 16.
+// IMPORTANT (for that rewrite): tile X/Y must match the hardcoded values in mul_mat_q4_K():
+//   MMQ_X_Q4_K_AMPERE=64, MMQ_Y_Q4_K_AMPERE=128.
+// Mismatch between dispatch shared-memory sizes and kernel constants causes OOB + wrong results.
+#define  MMQ_X_Q4_K_INTEL_BMG 64
+#define  MMQ_Y_Q4_K_INTEL_BMG 128
+#define NWARPS_Q4_K_INTEL_BMG   4
+
 template <bool need_check> static void
     mul_mat_q4_K(
     const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
@@ -2606,9 +2619,19 @@ static void ggml_mul_mat_q4_K_q8_1_sycl(const void *vx, const void *vy,
     SYCL_CHECK(
         CHECK_TRY_ERROR(id = get_current_device_id()));
     const int compute_capability = ggml_sycl_info().devices[id].cc;
+    const auto arch = ggml_sycl_info().devices[id].hw_info.arch;
 
     int mmq_x, mmq_y, nwarps;
-    if (compute_capability >= VER_GEN13) {
+    if (arch == gpu_arch::intel_gpu_bmg_g21 ||
+        arch == gpu_arch::intel_gpu_bmg_g31) {
+        // Q4_K is incompatible with Intel WARP_SIZE=16:
+        //   blocks_per_warp = WARP_SIZE/QI4_K = 16/32 = 0 in mul_mat_q → infinite loop.
+        // ggml_sycl_supports_mmq() must return false for Q4_K on BMG to prevent reaching here.
+        GGML_ABORT("Q4_K MMQ on Intel BMG: WARP_SIZE(%d) < QI4_K(%d) → "
+                   "blocks_per_warp=0 → infinite loop. "
+                   "Fix ggml_sycl_supports_mmq to gate this path.",
+                   WARP_SIZE, QI4_K);
+    } else if (compute_capability >= VER_GEN13) {
         mmq_x  =  MMQ_X_Q4_K_RDNA2;
         mmq_y  =  MMQ_Y_Q4_K_RDNA2;
         nwarps = NWARPS_Q4_K_RDNA2;
