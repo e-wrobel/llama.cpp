@@ -52,6 +52,11 @@ The packages for FP32 and FP16 would have different accuracy and performance on 
 
 ## News
 
+- 2026.06
+  - Enable Q4_K MMQ (matrix multiplication quantized) kernel for Intel Arc Battlemage (B-Series, Xe2) via `GGML_SYCL_FORCE_MMQ=ON`.
+    Root cause: Xe2 WARP_SIZE=16 is smaller than QI4_K=32, causing `blocks_per_warp=0` in the legacy `mul_mat_q` path. Fix: dedicated `mul_mat_q4_K_bmg` kernel using `K_TILE=QI4_K=32` as the effective tile width, with `mmq_y=64` to avoid register spill.
+    Performance on dual Arc Pro B70 (Qwen3-80B Q4_K_M, tg128, 3 runs): **64.1 +/- 0.7 tok/s** vs 59.5 +/- 0.1 tok/s MMVQ baseline (+7.8%).
+
 - 2026.04-05
   - Optimize mul_mat by reorder feature for data type: Q4_K, Q5_K, Q6_K, Q8_0.
   - Fused MoE.
@@ -133,7 +138,7 @@ On older Intel GPUs, you may try [OpenCL](/docs/backend/OPENCL.md) although the 
 | Intel Data Center Max Series  | Support | Max 1550, 1100                        |
 | Intel Data Center Flex Series | Support | Flex 170                              |
 | Intel Arc A-Series            | Support | Arc A770, Arc A730M, Arc A750         |
-| Intel Arc B-Series            | Support | Arc B580                              |
+| Intel Arc B-Series            | Support | Arc B580, Arc Pro B70                 |
 | Intel built-in Arc GPU        | Support | built-in Arc GPU in Meteor Lake, Arrow Lake, Lunar Lake |
 | Intel iGPU                    | Support | iGPU in 13700k, 13400, i5-1250P, i7-1260P, i7-1165G7  |
 
@@ -755,6 +760,7 @@ use 1 SYCL GPUs: [0] with Max compute units:512
 | GGML_SYCL          | ON (mandatory)                        | Enable build with SYCL code path.           |
 | GGML_SYCL_TARGET   | INTEL *(default)*                     | Set the SYCL target device type.            |
 | GGML_SYCL_DEVICE_ARCH | Optional                           | Set the SYCL device architecture. Setting the device architecture can improve the performance. See the table [--offload-arch](https://github.com/intel/llvm/blob/sycl/sycl/doc/design/OffloadDesign.md#--offload-arch) for a list of valid architectures. |
+| GGML_SYCL_FORCE_MMQ | OFF *(default)* \|ON *(optional)*    | Enable experimental MMQ kernels for Intel Arc Battlemage (BMG/Xe2). Currently supports Q4_K only. Requires `GGML_SYCL=ON`. When OFF, the MMVQ path is used. |
 | GGML_SYCL_F16      | OFF *(default)* \|ON *(optional)*     | Enable FP16 build with SYCL code path. (1.) |
 | GGML_SYCL_GRAPH    | ON *(default)* \|OFF *(Optional)*     | Enable build with [SYCL Graph extension](https://github.com/intel/llvm/blob/sycl/sycl/doc/extensions/experimental/sycl_ext_oneapi_graph.asciidoc). |
 | GGML_SYCL_DNN      | ON *(default)* \|OFF *(Optional)*     | Enable build with oneDNN.                   |

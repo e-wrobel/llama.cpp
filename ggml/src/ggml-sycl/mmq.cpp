@@ -1682,7 +1682,7 @@ mul_mat_q3_K(
 // Intel Arc Battlemage (BMG, Xe2).
 // Uses mul_mat_q4_K_bmg with K_TILE=QI4_K=32 (wider than WARP_SIZE=16).
 // mmq_y=64 (not 128): WARP_SIZE=16 inflates sum[mmq_y/WARP_SIZE][...] to 128 values/thread,
-// causing register spill. 64 gives sum[4][16]=64 accumulators/thread — same as NVIDIA AMPERE.
+// causing register spill. 64 gives sum[4][16]=64 accumulators/thread - same as NVIDIA AMPERE.
 // Measured: 64.1 tok/s (mmq_y=64) vs 39.6 tok/s (mmq_y=128) on dual Arc Pro B70, Qwen3-80B Q4_K_M.
 #define  MMQ_X_Q4_K_INTEL_BMG 64
 #define  MMQ_Y_Q4_K_INTEL_BMG  64
@@ -1726,7 +1726,7 @@ static void mul_mat_q4_K_bmg(
 {
     constexpr int K_TILE = QI4_K;                  // 32
     constexpr int mmq_x  = MMQ_X_Q4_K_INTEL_BMG;  // 64
-    constexpr int mmq_y  = MMQ_Y_Q4_K_INTEL_BMG;  // 128
+    constexpr int mmq_y  = MMQ_Y_Q4_K_INTEL_BMG;  // 64
     constexpr int nwarps = NWARPS_Q4_K_INTEL_BMG;  // 4
 
     const block_q4_K * x = (const block_q4_K *) vx;
