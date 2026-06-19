@@ -906,6 +906,26 @@ static __dpct_inline__ float vec_dot_q4_K_q8_1_mul_mat(
                                       x_dm[i * (WARP_SIZE/QI4_K) + i/QI4_K], &y_ds[index_y/QI8_1]);
 }
 
+// Intel Arc BMG: same dot product logic as above but with K_TILE=QI4_K=32 tile layout.
+// On BMG WARP_SIZE=16, so the tile stores QI4_K elements per row (not WARP_SIZE).
+// k ranges [ir*K_TILE/QR4_K, (ir+1)*K_TILE/QR4_K) in steps of VDR_Q4_K_Q8_1_MMQ.
+static __dpct_inline__ float vec_dot_q4_K_q8_1_mul_mat_bmg(
+    const int *__restrict__ x_ql, const sycl::half2 *__restrict__ x_dm,
+    const int *__restrict__ x_qh, const int *__restrict__ x_sc,
+    const int *__restrict__ y_qs, const sycl::half2 *__restrict__ y_ds,
+    const int &i, const int &j, const int &k) {
+    (void)x_qh;
+
+    constexpr int K_TILE = QI4_K; // 32
+
+    const uint8_t * sc = ((const uint8_t *) &x_sc[i * (K_TILE/8) + i/8 + k/16]) + 2*((k % 16) / 8);
+
+    const int index_y = j * K_TILE + (QR4_K*k) % K_TILE;
+    return vec_dot_q4_K_q8_1_impl_mmq(
+        &x_ql[i * (K_TILE + 1) + k], &y_qs[index_y], sc, sc + 8,
+        x_dm[i + i/QI4_K], &y_ds[index_y/QI8_1]);
+}
+
 template <int mmq_y>
 static __dpct_inline__ void
 allocate_tiles_q5_K(int **x_ql, sycl::half2 **x_dm, int **x_qh, int **x_sc,
@@ -1660,15 +1680,12 @@ mul_mat_q3_K(
 #define NWARPS_Q4_K_PASCAL 8
 
 // Intel Arc Battlemage (BMG, Xe2).
-// NOTE: Q4_K MMQ is currently DISABLED on BMG — falls back to MMVQ (see ggml_sycl_supports_mmq).
-// Root cause: QI4_K(32) > WARP_SIZE(16) → blocks_per_warp = WARP_SIZE/QI4_K = 0 in mul_mat_q
-// → GPU hangs in an infinite loop. These constants are reserved for a future rewrite of
-// mul_mat_q / load_tiles_q4_K that supports QI > WARP_SIZE on Intel subgroup size 16.
-// IMPORTANT (for that rewrite): tile X/Y must match the hardcoded values in mul_mat_q4_K():
-//   MMQ_X_Q4_K_AMPERE=64, MMQ_Y_Q4_K_AMPERE=128.
-// Mismatch between dispatch shared-memory sizes and kernel constants causes OOB + wrong results.
+// Uses mul_mat_q4_K_bmg with K_TILE=QI4_K=32 (wider than WARP_SIZE=16).
+// mmq_y=64 (not 128): WARP_SIZE=16 inflates sum[mmq_y/WARP_SIZE][...] to 128 values/thread,
+// causing register spill. 64 gives sum[4][16]=64 accumulators/thread - same as NVIDIA AMPERE.
+// Measured: 64.1 tok/s (mmq_y=64) vs 39.6 tok/s (mmq_y=128) on dual Arc Pro B70, Qwen3-80B Q4_K_M.
 #define  MMQ_X_Q4_K_INTEL_BMG 64
-#define  MMQ_Y_Q4_K_INTEL_BMG 128
+#define  MMQ_Y_Q4_K_INTEL_BMG  64
 #define NWARPS_Q4_K_INTEL_BMG   4
 
 template <bool need_check> static void
@@ -1694,6 +1711,156 @@ template <bool need_check> static void
               vec_dot_q4_K_q8_1_mul_mat>(
         vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, tile_x_ql,
         tile_x_dm, tile_x_qh, tile_x_sc, item_ct1, tile_y_qs, tile_y_ds);
+}
+
+// Intel Arc BMG Q4_K kernel.  WARP_SIZE=16 but QI4_K=32, so we use K_TILE=QI4_K=32 as the
+// effective tile width.  Each thread handles K_TILE/WARP_SIZE=2 elements per Q4_K block.
+// Shared-memory sizes are K_TILE-based (identical to the NVIDIA WARP_SIZE=32 layout).
+template <bool need_check>
+static void mul_mat_q4_K_bmg(
+    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y,
+    const int nrows_dst, const sycl::nd_item<3> &item_ct1,
+    int *tile_x_ql, sycl::half2 *tile_x_dm, int *tile_x_sc,
+    int *tile_y_qs, sycl::half2 *tile_y_ds)
+{
+    constexpr int K_TILE = QI4_K;                  // 32
+    constexpr int mmq_x  = MMQ_X_Q4_K_INTEL_BMG;  // 64
+    constexpr int mmq_y  = MMQ_Y_Q4_K_INTEL_BMG;  // 64
+    constexpr int nwarps = NWARPS_Q4_K_INTEL_BMG;  // 4
+
+    const block_q4_K * x = (const block_q4_K *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    const int blocks_per_row_x = ncols_x / QK_K;
+    const int blocks_per_col_y = nrows_y / QK8_1;
+
+    const int row_dst_0 = item_ct1.get_group(2) * mmq_y;
+    const int col_dst_0 = item_ct1.get_group(1) * mmq_x;
+
+    const int k      = item_ct1.get_local_id(2); // 0..WARP_SIZE-1
+    const int j_warp = item_ct1.get_local_id(1); // 0..nwarps-1
+
+    float sum[mmq_y/WARP_SIZE][mmq_x/nwarps] = {{0.0f}};
+
+    for (int ib0 = 0; ib0 < blocks_per_row_x; ++ib0) {
+
+        // ---- Load X tile ------------------------------------------------
+
+        // ql: thread k fills columns k and k+WARP_SIZE of each row
+        for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+            int i = i0 + j_warp;
+            if (need_check) {
+                i = sycl::min(i, nrows_x - row_dst_0 - 1);
+            }
+            const block_q4_K * bxi = x + (row_dst_0 + i)*blocks_per_row_x + ib0;
+            tile_x_ql[i * (K_TILE + 1) + k]             = get_int_from_uint8_aligned(bxi->qs, k);
+            tile_x_ql[i * (K_TILE + 1) + k + WARP_SIZE] = get_int_from_uint8_aligned(bxi->qs, k + WARP_SIZE);
+        }
+
+        // dm: one half2 per row; 2 passes needed (nwarps*WARP_SIZE=64 threads, 128 rows)
+        for (int i0 = 0; i0 < mmq_y; i0 += nwarps * WARP_SIZE) {
+            int i = (i0 + j_warp * WARP_SIZE + k) % mmq_y;
+            if (need_check) {
+                i = sycl::min(i, nrows_x - row_dst_0 - 1);
+            }
+            const block_q4_K * bxi = x + (row_dst_0 + i)*blocks_per_row_x + ib0;
+            tile_x_dm[i + i/QI4_K] = bxi->dm;
+        }
+
+        // sc: K_TILE/8=4 ints per row; each thread handles 2 rows (k and k+WARP_SIZE)
+        for (int i0 = 0; i0 < mmq_y; i0 += nwarps * 8) {
+#pragma unroll
+            for (int pass = 0; pass < K_TILE/WARP_SIZE; ++pass) {
+                const int k_eff = k + pass * WARP_SIZE;
+                const int ksc   = k_eff % (K_TILE/8);
+                int i = (i0 + j_warp * 8 + k_eff / (K_TILE/8)) % mmq_y;
+                if (need_check) {
+                    i = sycl::min(i, nrows_x - row_dst_0 - 1);
+                }
+                const block_q4_K * bxi = x + (row_dst_0 + i)*blocks_per_row_x + ib0;
+                const int * scales = (const int *) bxi->scales;
+                int scales8 = (scales[(ksc%2) + (ksc!=0)] >> (4 * (ksc & (ksc/2)))) & 0x0F0F0F0F;
+                scales8    |= (scales[ksc/2]              >> (2 * (ksc % 2)))       & 0x30303030;
+                tile_x_sc[i * (K_TILE/8) + i/8 + ksc] = scales8;
+            }
+        }
+
+        // ---- Load Y tile and compute, one QR4_K phase at a time -----------
+
+        for (int ir = 0; ir < QR4_K; ++ir) {
+
+            // y_qs: K_TILE ints per column; two WARP_SIZE passes to cover K_TILE elements
+            for (int kqs_base = 0; kqs_base < K_TILE; kqs_base += WARP_SIZE) {
+                const int kqs  = ir * K_TILE + kqs_base + k;
+                const int kbxd = kqs / QI8_1;
+
+#pragma unroll
+                for (int i = 0; i < mmq_x; i += nwarps) {
+                    const int col_y_eff = sycl::min(
+                        (unsigned int)(col_dst_0 + j_warp + i),
+                        (unsigned int)(ncols_y - 1));
+                    const block_q8_1 * by0 =
+                        &y[col_y_eff * blocks_per_col_y + ib0*(QK_K/QK8_1) + kbxd];
+                    const int index_y = (j_warp + i) * K_TILE + kqs_base + k;
+                    tile_y_qs[index_y] = get_int_from_int8_aligned(by0->qs, k % QI8_1);
+                }
+            }
+
+            // y_ds: K_TILE/QI8_1=4 half2 per column (256 entries total).
+            // With WARP_SIZE=16 threads, k/4 only covers 0..3; need 2 passes to reach k/4=0..7.
+#pragma unroll
+            for (int ids0 = 0; ids0 < mmq_x; ids0 += nwarps * QI8_1) {
+#pragma unroll
+                for (int pass = 0; pass < K_TILE/WARP_SIZE; ++pass) {
+                    const int k_eff = k + pass * WARP_SIZE;
+                    const int ids  = (ids0 + j_warp * QI8_1 + k_eff / (K_TILE/QI8_1)) % mmq_x;
+                    const int kby  = k_eff % (K_TILE/QI8_1);
+                    const int col_y_eff = sycl::min(
+                        (unsigned int)(col_dst_0 + ids),
+                        (unsigned int)(ncols_y - 1));
+                    const sycl::half2 *dsi_src =
+                        &y[col_y_eff * blocks_per_col_y + ib0*(QK_K/QK8_1) + ir*(K_TILE/QI8_1) + kby].ds;
+                    sycl::half2 *dsi_dst = &tile_y_ds[ids * (K_TILE/QI8_1) + kby];
+                    *dsi_dst = *dsi_src;
+                }
+            }
+
+            item_ct1.barrier();
+
+            for (int kc = ir*K_TILE/QR4_K; kc < (ir+1)*K_TILE/QR4_K; kc += VDR_Q4_K_Q8_1_MMQ) {
+#pragma unroll
+                for (int j = 0; j < mmq_x; j += nwarps) {
+#pragma unroll
+                    for (int i = 0; i < mmq_y; i += WARP_SIZE) {
+                        sum[i/WARP_SIZE][j/nwarps] += vec_dot_q4_K_q8_1_mul_mat_bmg(
+                            tile_x_ql, tile_x_dm, nullptr, tile_x_sc,
+                            tile_y_qs, tile_y_ds,
+                            k + i, j_warp + j, kc);
+                    }
+                }
+            }
+
+            item_ct1.barrier();
+        }
+    }
+
+    // ---- Write output ---------------------------------------------------
+#pragma unroll
+    for (int j = 0; j < mmq_x; j += nwarps) {
+        const int col_dst = col_dst_0 + j + j_warp;
+        if (col_dst >= ncols_y) {
+            return;
+        }
+#pragma unroll
+        for (int i = 0; i < mmq_y; i += WARP_SIZE) {
+            const int row_dst = row_dst_0 + k + i;
+            if (row_dst >= nrows_dst) {
+                continue;
+            }
+            dst[col_dst*nrows_dst + row_dst] = sum[i/WARP_SIZE][j/nwarps];
+        }
+    }
 }
 
 #define  MMQ_X_Q5_K_RDNA2  64
@@ -2624,13 +2791,78 @@ static void ggml_mul_mat_q4_K_q8_1_sycl(const void *vx, const void *vy,
     int mmq_x, mmq_y, nwarps;
     if (arch == gpu_arch::intel_gpu_bmg_g21 ||
         arch == gpu_arch::intel_gpu_bmg_g31) {
-        // Q4_K is incompatible with Intel WARP_SIZE=16:
-        //   blocks_per_warp = WARP_SIZE/QI4_K = 16/32 = 0 in mul_mat_q → infinite loop.
-        // ggml_sycl_supports_mmq() must return false for Q4_K on BMG to prevent reaching here.
-        GGML_ABORT("Q4_K MMQ on Intel BMG: WARP_SIZE(%d) < QI4_K(%d) → "
-                   "blocks_per_warp=0 → infinite loop. "
-                   "Fix ggml_sycl_supports_mmq to gate this path.",
-                   WARP_SIZE, QI4_K);
+        mmq_x  = MMQ_X_Q4_K_INTEL_BMG;
+        mmq_y  = MMQ_Y_Q4_K_INTEL_BMG;
+        nwarps = NWARPS_Q4_K_INTEL_BMG;
+
+        const int block_num_x_bmg = (nrows_x + mmq_y - 1) / mmq_y;
+        const int block_num_y_bmg = (ncols_y + mmq_x - 1) / mmq_x;
+        const sycl::range<3> block_nums_bmg(1, block_num_y_bmg, block_num_x_bmg);
+        const sycl::range<3> block_dims_bmg(1, nwarps, WARP_SIZE);
+        // K_TILE=QI4_K=32: effective tile width for Q4_K on WARP_SIZE=16 Intel hardware.
+        // Shared-memory layout is identical to the NVIDIA WARP_SIZE=32 path.
+        constexpr int K_TILE_BMG = QI4_K;
+
+        if (nrows_x % mmq_y == 0) {
+            const bool need_check = false;
+            {
+                dpct::has_capability_or_fail(stream->get_device(), {sycl::aspect::fp16});
+                stream->submit([&](sycl::handler &cgh) {
+                    sycl::local_accessor<int, 1> tile_x_ql_acc(
+                        sycl::range<1>(mmq_y * (K_TILE_BMG + 1)), cgh);
+                    sycl::local_accessor<sycl::half2, 1> tile_x_dm_acc(
+                        sycl::range<1>(mmq_y + mmq_y / K_TILE_BMG), cgh);
+                    sycl::local_accessor<int, 1> tile_x_sc_acc(
+                        sycl::range<1>(mmq_y * (K_TILE_BMG/8) + mmq_y/8), cgh);
+                    sycl::local_accessor<int, 1> tile_y_qs_acc(
+                        sycl::range<1>(mmq_x * K_TILE_BMG), cgh);
+                    sycl::local_accessor<sycl::half2, 1> tile_y_ds_acc(
+                        sycl::range<1>(mmq_x * K_TILE_BMG / QI8_1), cgh);
+                    cgh.parallel_for(
+                        sycl::nd_range<3>(block_nums_bmg * block_dims_bmg, block_dims_bmg),
+                        [=](sycl::nd_item<3> item_ct1) {
+                            mul_mat_q4_K_bmg<need_check>(
+                                vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
+                                nrows_dst, item_ct1,
+                                get_pointer(tile_x_ql_acc),
+                                get_pointer(tile_x_dm_acc),
+                                get_pointer(tile_x_sc_acc),
+                                get_pointer(tile_y_qs_acc),
+                                get_pointer(tile_y_ds_acc));
+                        });
+                });
+            }
+        } else {
+            const bool need_check = true;
+            {
+                dpct::has_capability_or_fail(stream->get_device(), {sycl::aspect::fp16});
+                stream->submit([&](sycl::handler &cgh) {
+                    sycl::local_accessor<int, 1> tile_x_ql_acc(
+                        sycl::range<1>(mmq_y * (K_TILE_BMG + 1)), cgh);
+                    sycl::local_accessor<sycl::half2, 1> tile_x_dm_acc(
+                        sycl::range<1>(mmq_y + mmq_y / K_TILE_BMG), cgh);
+                    sycl::local_accessor<int, 1> tile_x_sc_acc(
+                        sycl::range<1>(mmq_y * (K_TILE_BMG/8) + mmq_y/8), cgh);
+                    sycl::local_accessor<int, 1> tile_y_qs_acc(
+                        sycl::range<1>(mmq_x * K_TILE_BMG), cgh);
+                    sycl::local_accessor<sycl::half2, 1> tile_y_ds_acc(
+                        sycl::range<1>(mmq_x * K_TILE_BMG / QI8_1), cgh);
+                    cgh.parallel_for(
+                        sycl::nd_range<3>(block_nums_bmg * block_dims_bmg, block_dims_bmg),
+                        [=](sycl::nd_item<3> item_ct1) {
+                            mul_mat_q4_K_bmg<need_check>(
+                                vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y,
+                                nrows_dst, item_ct1,
+                                get_pointer(tile_x_ql_acc),
+                                get_pointer(tile_x_dm_acc),
+                                get_pointer(tile_x_sc_acc),
+                                get_pointer(tile_y_qs_acc),
+                                get_pointer(tile_y_ds_acc));
+                        });
+                });
+            }
+        }
+        return;
     } else if (compute_capability >= VER_GEN13) {
         mmq_x  =  MMQ_X_Q4_K_RDNA2;
         mmq_y  =  MMQ_Y_Q4_K_RDNA2;

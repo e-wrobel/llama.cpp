@@ -3508,12 +3508,8 @@ inline bool ggml_sycl_supports_mmq(enum ggml_type type, int device_id) {
     if (is_bmg) {
         switch (type) {
             case GGML_TYPE_Q4_K:
-                // BMG falls back to MMVQ for Q4_K.
-                // Root cause: QI4_K(32) > WARP_SIZE(16) → blocks_per_warp = WARP_SIZE/QI4_K = 0
-                // in mul_mat_q's outer loop → GPU hangs in an infinite loop.
-                // Enabling this requires a WARP_SIZE-aware rewrite of mul_mat_q / load_tiles_q4_K
-                // that handles QI > WARP_SIZE (process multiple blocks per iteration).
-                return false;
+                // mul_mat_q4_K_bmg handles WARP_SIZE(16) < QI4_K(32) via K_TILE=32 tile layout.
+                return true;
             default:
                 return false;
         }
